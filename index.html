@@ -168,8 +168,11 @@
 </div>
 
 <script>
-  // Free, no-auth CORS proxy
-  const CORS_PROXY = 'https://api.allorigins.win/raw?url=';
+  // Free, no-auth CORS proxies — tried in order
+  const PROXY_LIST = [
+    'https://corsproxy.io/?',
+    'https://api.allorigins.win/raw?url=',
+  ];
 
   const urlInput   = document.getElementById('url');
   const btn        = document.getElementById('downloadBtn');
@@ -200,10 +203,24 @@
     show('', '');
 
     try {
-      const resp = await fetch(CORS_PROXY + encodeURIComponent(url));
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      let text = null;
+      let lastError = null;
 
-      const text = await resp.text();
+      for (const proxy of PROXY_LIST) {
+        try {
+          const resp = await fetch(proxy + encodeURIComponent(url), {
+            signal: AbortSignal.timeout(15000),
+          });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          text = await resp.text();
+          break; // success — stop trying other proxies
+        } catch (err) {
+          lastError = err;
+          continue; // try next proxy
+        }
+      }
+
+      if (text === null) throw lastError || new Error('All proxies failed.');
 
       if (!text.includes('BEGIN:VCALENDAR')) {
         throw new Error("Doesn't look like a valid iCal file (missing BEGIN:VCALENDAR).");
