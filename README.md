@@ -1,6 +1,8 @@
 # fetch-ics
 
-Download any iCal (`.ics`) file from a URL and save it locally — no extra dependencies.
+**[🌐 Try the web tool →](https://stoner19.github.io/fetch-ics/)**
+
+Download any iCal (`.ics`) file from a URL — as a Python script or right in your browser.
 
 Useful when a calendar site only gives you a subscription link instead of a direct download, or when you want to grab a static snapshot of a live feed.
 
