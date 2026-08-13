@@ -29,3 +29,7 @@ Thumbs.db
 
 # Interactive setup script (personal auth flow)
 setup-and-push.sh
+
+# Local debug output — may contain private calendar URLs
+errors.txt
+*.log

@@ -59,8 +59,13 @@
       gap: 8px;
     }
 
-    input[type="url"] {
+    .field-group + .field-group {
+      margin-top: 18px;
+    }
+
+    input[type="url"], input[type="text"] {
       flex: 1;
+      min-width: 0;
       background: #0d1117;
       border: 1px solid #30363d;
       border-radius: 8px;
@@ -72,11 +77,11 @@
       transition: border-color 0.2s;
     }
 
-    input[type="url"]:focus {
+    input[type="url"]:focus, input[type="text"]:focus {
       border-color: #58a6ff;
     }
 
-    input[type="url"]::placeholder {
+    input[type="url"]::placeholder, input[type="text"]::placeholder {
       color: #484f58;
     }
 
@@ -145,16 +150,31 @@
     Paste any iCal (`.ics`) subscription URL — it downloads and saves the calendar file to your computer.
   </p>
 
-  <label for="url">iCal URL</label>
-  <div class="input-row">
-    <input
-      type="url"
-      id="url"
-      placeholder="https://example.com/calendar.ics"
-      autofocus
-      spellcheck="false"
-    />
-    <button id="downloadBtn" onclick="downloadIcs()">Download</button>
+  <div class="field-group">
+    <label for="url">iCal URL</label>
+    <div class="input-row">
+      <input
+        type="url"
+        id="url"
+        placeholder="https://example.com/calendar.ics"
+        autofocus
+        spellcheck="false"
+      />
+    </div>
+  </div>
+
+  <div class="field-group">
+    <label for="filename">Save as</label>
+    <div class="input-row">
+      <input
+        type="text"
+        id="filename"
+        placeholder="calendar.ics"
+        spellcheck="false"
+        autocomplete="off"
+      />
+      <button id="downloadBtn" onclick="downloadIcs()">Download</button>
+    </div>
   </div>
 
   <div id="message" class="message"></div>
@@ -168,77 +188,196 @@
 </div>
 
 <script>
-  // Free, no-auth CORS proxies — tried in order
-  const PROXY_LIST = [
-    'https://corsproxy.io/?',
-    'https://api.allorigins.win/raw?url=',
+  // Ordered fetch strategies. "direct" works for feeds that already send
+  // CORS headers; the rest are free, no-auth proxies used as fallbacks.
+  const STRATEGIES = [
+    {
+      name: 'direct',
+      build: u => ({ url: u }),
+    },
+    {
+      name: 'allorigins',
+      build: u => ({ url: 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u) }),
+    },
+    {
+      // Returns the page body wrapped in <html><body>…</body></html> but,
+      // unlike its text mode, keeps line breaks intact — required for iCal.
+      name: 'jina',
+      build: u => ({ url: 'https://r.jina.ai/' + u, headers: { 'X-Return-Format': 'html' } }),
+    },
+    {
+      name: 'allorigins-json',
+      build: u => ({ url: 'https://api.allorigins.win/get?url=' + encodeURIComponent(u), json: true }),
+    },
   ];
 
-  const urlInput   = document.getElementById('url');
-  const btn        = document.getElementById('downloadBtn');
-  const msgEl      = document.getElementById('message');
+  // Free proxies return sporadic 408/5xx even when the target is healthy,
+  // so every strategy gets several passes before giving up.
+  const ROUNDS = 3;
+  const TIMEOUT_MS = 20000;
 
-  // Allow Enter key to trigger download
-  urlInput.addEventListener('keydown', e => {
-    if (e.key === 'Enter') downloadIcs();
+  const urlInput  = document.getElementById('url');
+  const nameInput = document.getElementById('filename');
+  const btn       = document.getElementById('downloadBtn');
+  const msgEl     = document.getElementById('message');
+
+  // Once the user types their own filename, stop overwriting it from the URL.
+  let nameEdited = false;
+
+  for (const el of [urlInput, nameInput]) {
+    el.addEventListener('keydown', e => {
+      if (e.key === 'Enter') downloadIcs();
+    });
+  }
+
+  urlInput.addEventListener('input', syncFilename);
+
+  nameInput.addEventListener('input', () => {
+    nameEdited = nameInput.value.trim() !== '';
+    if (!nameEdited) syncFilename();
   });
 
+  function syncFilename() {
+    if (nameEdited) return;
+    let suggestion = '';
+    try {
+      suggestion = deriveFilename(normalizeUrl(urlInput.value));
+    } catch (_) { /* incomplete or invalid URL — leave the field empty */ }
+    nameInput.value = suggestion;
+  }
+
   function show(msg, type) {
+    if (!msg) { msgEl.className = 'message'; msgEl.textContent = ''; return; }
     msgEl.textContent = msg;
     msgEl.className = 'message show ' + type;
   }
 
-  function setLoading(on) {
+  function setLoading(on, label) {
     btn.disabled = on;
     btn.innerHTML = on
-      ? '<span class="spinner"></span>Fetching…'
+      ? '<span class="spinner"></span>' + (label || 'Fetching…')
       : 'Download';
   }
 
+  function timeoutSignal(ms) {
+    if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+      return AbortSignal.timeout(ms);
+    }
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), ms);
+    return ctrl.signal;
+  }
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  function normalizeUrl(raw) {
+    let url = raw.trim();
+    // Subscription links are commonly handed out as webcal://
+    if (/^webcal:\/\//i.test(url)) url = 'https://' + url.slice('webcal://'.length);
+    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+    const parsed = new URL(url); // throws on malformed input
+    // new URL() happily accepts things like "https://not a url"
+    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(parsed.hostname)) {
+      throw new Error('invalid hostname');
+    }
+    return url;
+  }
+
+  // Pull the calendar out of whatever wrapper a proxy added around it.
+  function extractCalendar(text) {
+    const start = text.indexOf('BEGIN:VCALENDAR');
+    if (start === -1) return null;
+    const endTag = 'END:VCALENDAR';
+    const end = text.lastIndexOf(endTag);
+    if (end === -1 || end < start) return null;
+    return text.slice(start, end + endTag.length).trim() + '\r\n';
+  }
+
+  async function attempt(strategy, url) {
+    const { url: target, headers, json } = strategy.build(url);
+    const resp = await fetch(target, {
+      headers: headers || {},
+      signal: timeoutSignal(TIMEOUT_MS),
+    });
+    if (!resp.ok) throw new Error(`${strategy.name}: HTTP ${resp.status}`);
+
+    let body = await resp.text();
+    if (json) {
+      const parsed = JSON.parse(body);
+      body = parsed.contents || '';
+    }
+
+    const ics = extractCalendar(body);
+    // A 200 carrying an error page is a proxy failure, not a bad calendar —
+    // keep trying instead of surfacing it as a fatal result.
+    if (!ics) throw new Error(`${strategy.name}: response was not an iCal feed`);
+    return ics;
+  }
+
+  function sanitizeFilename(name) {
+    let stem = name.trim().replace(/\.ics$/i, '');
+    stem = stem.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/^\.+/, '').trim();
+    return (stem || 'calendar') + '.ics';
+  }
+
+  function deriveFilename(url) {
+    try {
+      const u = new URL(url);
+      let stem = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '');
+      if (!stem.trim()) stem = u.hostname.replace(/^www\./, '');
+      return sanitizeFilename(stem);
+    } catch (_) {
+      return 'calendar.ics';
+    }
+  }
+
   async function downloadIcs() {
-    const url = urlInput.value.trim();
-    if (!url) { show('Please enter a URL.', 'error'); return; }
+    const raw = urlInput.value.trim();
+    if (!raw) { show('Please enter a URL.', 'error'); return; }
+
+    let url;
+    try {
+      url = normalizeUrl(raw);
+    } catch (_) {
+      show('✗ That doesn\u2019t look like a valid URL.', 'error');
+      return;
+    }
 
     setLoading(true);
     show('', '');
 
-    try {
-      let text = null;
-      let lastError = null;
+    let ics = null;
+    const errors = [];
 
-      for (const proxy of PROXY_LIST) {
+    outer:
+    for (let round = 0; round < ROUNDS; round++) {
+      for (const strategy of STRATEGIES) {
+        setLoading(true, round === 0 ? 'Fetching…' : `Retrying (${round + 1}/${ROUNDS})…`);
         try {
-          const resp = await fetch(proxy + encodeURIComponent(url), {
-            signal: AbortSignal.timeout(15000),
-          });
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-          text = await resp.text();
-          break; // success — stop trying other proxies
+          ics = await attempt(strategy, url);
+          break outer;
         } catch (err) {
-          lastError = err;
-          continue; // try next proxy
+          errors.push(err.name === 'TimeoutError' || err.name === 'AbortError'
+            ? `${strategy.name}: timed out`
+            : err.message);
         }
       }
+      if (round < ROUNDS - 1) await sleep(800 * (round + 1));
+    }
 
-      if (text === null) throw lastError || new Error('All proxies failed.');
-
-      if (!text.includes('BEGIN:VCALENDAR')) {
-        throw new Error("Doesn't look like a valid iCal file (missing BEGIN:VCALENDAR).");
+    try {
+      if (!ics) {
+        throw new Error(
+          'Could not fetch the calendar. Last error \u2014 ' + errors[errors.length - 1]
+        );
       }
 
-      // Derive a filename from the URL
-      let filename = 'calendar.ics';
-      try {
-        const u = new URL(url);
-        const stem = u.pathname.split('/').pop();
-        if (stem && stem !== url) {
-          filename = stem.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_') + '.ics';
-          if (!filename.endsWith('.ics')) filename += '.ics';
-        }
-      } catch (_) { /* use default */ }
+      const filename = nameInput.value.trim()
+        ? sanitizeFilename(nameInput.value)
+        : deriveFilename(url);
+      nameInput.value = filename;
 
-      // Trigger download
-      const blob = new Blob([text], { type: 'text/calendar;charset=utf-8' });
+      const blob = new Blob([ics], { type: 'text/calendar;charset=utf-8' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = filename;
@@ -246,7 +385,6 @@
       URL.revokeObjectURL(a.href);
 
       show('✓ Downloaded ' + filename, 'success');
-
     } catch (err) {
       show('✗ ' + err.message, 'error');
     } finally {
